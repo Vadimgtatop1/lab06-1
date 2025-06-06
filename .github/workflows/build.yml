@@ -1,0 +1,241 @@
+name: Build and Package Outrun
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang cmake libsfml-dev
+          
+      - name: Build with CMake
+        run: |
+          mkdir build
+          cd build
+          cmake -DCMAKE_CXX_COMPILER=clang++ ..
+          make
+          
+      - name: Create DEB package
+        run: |
+          mkdir -p outrun-game/usr/games
+          mkdir -p outrun-game/usr/share/outrun-game/images
+          cp build/outrun outrun-game/usr/games/
+          cp -r images/* outrun-game/usr/share/outrun-game/images/
+          mkdir -p outrun-game/DEBIAN
+          echo "Package: outrun-game" > outrun-game/DEBIAN/control
+          echo "Version: 1.0" >> outrun-game/DEBIAN/control
+          echo "Section: games" >> outrun-game/DEBIAN/control
+          echo "Priority: optional" >> outrun-game/DEBIAN/control
+          echo "Architecture: amd64" >> outrun-game/DEBIAN/control
+          echo "Maintainer: Kirill207 <kirya.sherstyuk.05@mail.ru>" >> outrun-game/DEBIAN/control
+          echo "Description: Outrun Racing Game" >> outrun-game/DEBIAN/control
+          dpkg-deb --build outrun-game
+          mv outrun-game.deb outrun-game_1.0_amd64.deb
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: outrun-game-deb
+          path: outrun-game_1.0_amd64.deb
+
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          choco install cmake --installargs 'ADD_CMAKE_TO_PATH=System' -y
+          choco install wixtoolset -y
+       
+      - name: Download and extract SFML
+        run: |
+          if (-not (Test-Path "C:/tools")) {
+              New-Item -ItemType Directory -Path "C:/tools" | Out-Null
+          }
+          
+          $url = "https://www.sfml-dev.org/files/SFML-2.6.1-windows-vc17-64-bit.zip"
+          $downloadPath = "$env:RUNNER_TEMP/sfml.zip"
+          
+          try {
+              Write-Host "Downloading SFML from $url"
+              Invoke-WebRequest -Uri $url -OutFile $downloadPath -ErrorAction Stop
+              
+              Write-Host "Extracting SFML to C:/tools/SFML"
+              Expand-Archive -Path $downloadPath -DestinationPath "C:/tools" -ErrorAction Stop
+              
+              $extractedDir = Get-ChildItem "C:/tools" -Directory | Where-Object { $_.Name -like "SFML-*" }
+              if ($extractedDir) {
+                  Rename-Item -Path $extractedDir.FullName -NewName "SFML" -ErrorAction Stop
+              }
+              
+              $sfmlBinPath = "C:/tools/SFML/bin"
+              if (Test-Path $sfmlBinPath) {
+                  echo "$sfmlBinPath" | Out-File -FilePath $env:GITHUB_PATH -Append
+              } else {
+                  Write-Error "SFML binaries directory not found after extraction"
+                  exit 1
+              }
+          } catch {
+              Write-Error "Failed to download or extract SFML: $_"
+              exit 1
+          }
+          finally {
+              if (Test-Path $downloadPath) {
+                  Remove-Item $downloadPath -Force
+              }
+          }
+    
+      - name: Verify SFML installation
+        run: |
+          $sfmlPath = "C:/tools/SFML"
+          if (-not (Test-Path $sfmlPath)) {
+              Write-Error "SFML not found at $sfmlPath"
+              exit 1
+          }
+          
+          Write-Host "SFML directory contents:"
+          Get-ChildItem $sfmlPath -Recurse | Select-Object FullName | Out-Host
+          
+          $requiredDirs = @("bin", "lib", "include")
+          foreach ($dir in $requiredDirs) {
+              if (-not (Test-Path "$sfmlPath/$dir")) {
+                  Write-Error "Required SFML directory not found: $dir"
+                  exit 1
+              }
+          }
+          
+      - name: Build with CMake
+        run: |
+          mkdir build
+          cd build
+          cmake -DSFML_DIR="C:/tools/SFML/lib/cmake/SFML" ..
+          cmake --build . --config Release
+          
+      - name: Prepare package files
+        run: |
+          $sfmlBinPath = "C:/tools/SFML/bin"
+          $installDir = "pkg/INSTALLDIR"
+          
+          if (-not (Test-Path $sfmlBinPath)) {
+              Write-Error "SFML binaries directory not found at $sfmlBinPath"
+              exit 1
+          }
+          
+          if (-not (Test-Path "build/Release/outrun.exe")) {
+              Write-Error "Built executable not found"
+              exit 1
+          }
+          
+          New-Item -ItemType Directory -Path $installDir -Force | Out-Null
+          Copy-Item -Path "build/Release/outrun.exe" -Destination "$installDir/" -ErrorAction Stop
+          
+          $requiredDlls = @(
+              "sfml-graphics-2.dll",
+              "sfml-window-2.dll",
+              "sfml-system-2.dll",
+              "sfml-audio-2.dll",
+              "openal32.dll"
+          )
+          
+          foreach ($dll in $requiredDlls) {
+              $sourcePath = "$sfmlBinPath/$dll"
+              if (Test-Path $sourcePath) {
+                  Copy-Item -Path $sourcePath -Destination "$installDir/" -ErrorAction Stop
+              } else {
+                  Write-Error "DLL file not found: $sourcePath"
+                  exit 1
+              }
+          }
+          
+          if (Test-Path "images") {
+              New-Item -ItemType Directory -Path "$installDir/images" -Force | Out-Null
+              Copy-Item -Path "images/*" -Destination "$installDir/images/" -ErrorAction Stop
+          } else {
+              Write-Error "Images directory not found"
+              exit 1
+          }
+          
+      - name: Create MSI package
+        run: |
+          $componentGuid = [guid]::NewGuid().ToString().ToUpper()
+          $upgradeGuid = [guid]::NewGuid().ToString().ToUpper()
+          
+          $productWxs = @"
+          <?xml version="1.0"?>
+          <Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+            <Product 
+              Id="*" 
+              Name="Outrun" 
+              Version="1.0" 
+              Manufacturer="Kiril207" 
+              Language="1033"
+              UpgradeCode="$upgradeGuid">
+              <Package InstallerVersion="200" Compressed="yes"/>
+              <MediaTemplate EmbedCab="yes"/>
+              
+              <Directory Id="TARGETDIR" Name="SourceDir">
+                <Directory Id="ProgramFilesFolder">
+                  <Directory Id="INSTALLDIR" Name="Outrun">
+                    <Component Id="MainComponent" Guid="$componentGuid">
+                      <File Id="OutrunEXE" Source="pkg/INSTALLDIR/outrun.exe" KeyPath="yes"/>
+                      <File Id="SFMLGraphicsDLL" Source="pkg/INSTALLDIR/sfml-graphics-2.dll"/>
+                      <File Id="SFMLWindowDLL" Source="pkg/INSTALLDIR/sfml-window-2.dll"/>
+                      <File Id="SFMLSystemDLL" Source="pkg/INSTALLDIR/sfml-system-2.dll"/>
+                      <File Id="SFMLAudioDLL" Source="pkg/INSTALLDIR/sfml-audio-2.dll"/>
+                      <File Id="OpenALDLL" Source="pkg/INSTALLDIR/openal32.dll"/>
+                    </Component>
+                    
+                    <Directory Id="ImagesDir" Name="images">
+                      <Component Id="ImagesComponent" Guid="$([guid]::NewGuid().ToString().ToUpper())">
+                        <File Id="Image1" Source="pkg/INSTALLDIR/images/1.png"/>
+                        <File Id="Image2" Source="pkg/INSTALLDIR/images/2.png"/>
+                        <File Id="Image3" Source="pkg/INSTALLDIR/images/3.png"/>
+                        <File Id="Image4" Source="pkg/INSTALLDIR/images/4.png"/>
+                        <File Id="Image5" Source="pkg/INSTALLDIR/images/5.png"/>
+                        <File Id="Image6" Source="pkg/INSTALLDIR/images/6.png"/>
+                        <File Id="Image7" Source="pkg/INSTALLDIR/images/7.png"/>
+                        <File Id="ImageBG" Source="pkg/INSTALLDIR/images/bg.png"/>
+                      </Component>
+                    </Directory>
+                  </Directory>
+                </Directory>
+              </Directory>
+              
+              <Feature Id="MainFeature" Title="Main Feature" Level="1">
+                <ComponentRef Id="MainComponent"/>
+                <ComponentRef Id="ImagesComponent"/>
+              </Feature>
+              
+              <UIRef Id="WixUI_Minimal"/>
+            </Product>
+          </Wix>
+          "@
+          
+          Set-Content -Path product.wxs -Value $productWxs
+          
+          # Compile the installer
+          candle.exe product.wxs
+          light.exe product.wixobj -ext WixUIExtension -out outrun-game.msi
+          
+          if (Test-Path outrun-game.msi) {
+              Write-Host "MSI package created successfully!"
+          } else {
+              Write-Error "Failed to create MSI package!"
+              exit 1
+          }
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: outrun-game-msi
+          path: outrun-game.msi
